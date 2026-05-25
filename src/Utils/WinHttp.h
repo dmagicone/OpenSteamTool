@@ -49,4 +49,7 @@ namespace WinHttp {
                      const wchar_t* headers,
                      const char* urlForLog = "");
 
+    // Called during DLL shutdown to unblock any thread currently inside WinHTTP.
+    void AbortAll();
+
 }

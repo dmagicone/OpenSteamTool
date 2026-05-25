@@ -86,10 +86,17 @@ namespace Hooks_Manifest {
     HINTERNET   g_hSession = nullptr;
     HINTERNET   g_hConnect = nullptr;
     bool        g_tls      = false;
+    // BUG-04 FIX: Track the current host and port so we can detect when the
+    // config hot-reloads to a different host and reconnect accordingly.
+    static std::wstring     g_currentHost;
+    static INTERNET_PORT    g_currentPort = 0;
 
     void EnsureConnection(const wchar_t* host, INTERNET_PORT port, bool tls) {
-        // Already connected to the right host — reuse
-        if (g_hSession && g_hConnect)
+        if (g_Shutdown.load()) return;
+
+        // BUG-04 FIX: Reuse only if the host and port actually match.
+        if (g_hSession && g_hConnect
+            && g_currentHost == host && g_currentPort == port)
             return;
 
         // Clean up stale handles
@@ -112,12 +119,28 @@ namespace Hooks_Manifest {
         if (!g_hConnect) {
             WinHttpCloseHandle(g_hSession);
             g_hSession = nullptr;
+        } else {
+            // BUG-04 FIX: Record the connected host/port for future checks.
+            g_currentHost = host;
+            g_currentPort = port;
         }
     }
 
     void CloseConnection() {
+        if (g_Shutdown.load()) {
+            // During process detach, active request handles are aborted by
+            // WinHttp::AbortAll(); do not risk blocking here on connection
+            // teardown while Steam is closing.
+            g_hConnect = nullptr;
+            g_hSession = nullptr;
+            g_currentHost.clear();
+            g_currentPort = 0;
+            return;
+        }
         if (g_hConnect) { WinHttpCloseHandle(g_hConnect); g_hConnect = nullptr; }
         if (g_hSession) { WinHttpCloseHandle(g_hSession); g_hSession = nullptr; }
+        g_currentHost.clear();
+        g_currentPort = 0;
     }
 
     // Try ExecuteEx on the persistent connection; on failure reset
@@ -150,17 +173,17 @@ namespace Hooks_Manifest {
 
         if (!r.ok || r.status != 200) return false;
 
-        if (size_t key = r.body.find("\"content\""); key != std::string::npos) {
-            if (size_t q1 = r.body.find('"', key + 9); q1 != std::string::npos) {
-                if (size_t q2 = r.body.find('"', q1 + 1); q2 != std::string::npos) {
-                    uint64_t code = 0;
-                    auto [_, ec] = std::from_chars(
-                        r.body.data() + q1 + 1, r.body.data() + q2, code);
-                    if (ec == std::errc{}) {
-                        *outRequestCode = code;
-                        return true;
-                    }
-                }
+        // BUG-11 FIX: Use std::regex instead of fragile chained find() calls.
+        // The old approach silently failed on whitespace or field reordering.
+        static const std::regex re("\"content\"\\s*:\\s*\"(\\d+)\"");
+        std::smatch m;
+        if (std::regex_search(r.body, m, re)) {
+            uint64_t code = 0;
+            const std::string digits = m[1].str();
+            auto [_, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), code);
+            if (ec == std::errc{}) {
+                *outRequestCode = code;
+                return true;
             }
         }
         return false;
@@ -195,7 +218,10 @@ namespace Hooks_Manifest {
 
     // ── resolve (single-provider, no fallback) ────────────────────
     bool FetchManifestRequestCode(uint64_t manifestGid, uint64_t* outRequestCode, AppId_t AppId, AppId_t DepotId) {
+        if (g_Shutdown.load()) return false;
+
         std::lock_guard<std::mutex> lock(g_ConnectionMutex);
+        if (g_Shutdown.load()) return false;
 
         // Try extended Lua function first (receives app_id, depot_id, gid)
         if (AppId && DepotId && LuaConfig::HasManifestCodeFuncEx()) {

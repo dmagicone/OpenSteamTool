@@ -1,13 +1,25 @@
 #include "dllmain.h"
 #include "Hook/HookManager.h"
 #include "Utils/FileWatcher.h"
+#include "Utils/WinHttp.h"
 
-// Load diversion.dll and prepare key runtime paths.
+// BUG-13 FIX: Derive Steam install path from the loaded module itself
+// instead of GetCurrentDirectoryA(), which returns the process working
+// directory and may not match the Steam installation directory.
 bool LoadDiversion()
 {
-    if (!GetCurrentDirectoryA(MAX_PATH, SteamInstallPath)) {
+    HMODULE hSelf = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&LoadDiversion), &hSelf);
+    if (!hSelf || !GetModuleFileNameA(hSelf, SteamInstallPath, MAX_PATH)) {
         return false;
     }
+    // Strip the filename, keeping only the directory.
+    char* lastSlash = strrchr(SteamInstallPath, '\\');
+    if (lastSlash) *lastSlash = '\0';
+
     sprintf_s(SteamclientPath, MAX_PATH, "%s\\steamclient64.dll",  SteamInstallPath);
     sprintf_s(DiversionPath,   MAX_PATH, "%s\\bin\\diversion.dll", SteamInstallPath);
     sprintf_s(LuaDir,          MAX_PATH, "%s\\config\\lua",        SteamInstallPath);
@@ -21,8 +33,8 @@ bool LoadDiversion()
                   SteamclientPath, DiversionPath, GetLastError());
         return false;
     }
-    diversion_hMdoule = LoadLibraryA(DiversionPath);
-    if (!diversion_hMdoule) {
+    diversion_hModule = LoadLibraryA(DiversionPath);
+    if (!diversion_hModule) {
         LOG_ERROR("LoadLibraryA failed: {} (err={})", DiversionPath, GetLastError());
         return false;
     }
@@ -51,19 +63,40 @@ static void DetectSteamBuildId() {
     LOG_INFO("SteamVersion: build id = {}", g_steamBuildId);
 }
 
+// BUG-01 FIX: Track the init thread handle so DLL_PROCESS_DETACH can
+// wait for it to finish before tearing down hooks.
+static HANDLE g_InitThread = nullptr;
+
 // All initialisation that touches the filesystem, calls LoadLibrary, scans
 // memory, or installs detours runs here on a worker thread — we MUST NOT do
 // any of that from inside DllMain (loader lock).
 static DWORD WINAPI InitThread(LPVOID param) {
+    if (g_Shutdown.load()) return 0;
     HMODULE selfModule = static_cast<HMODULE>(param);
     Log::Init(selfModule);
     LOG_INFO("OpenSteamTool init thread started");
 
+    if (g_Shutdown.load()) {
+        g_HooksInstalled.store(true);
+        return 0;
+    }
+
     DetectSteamBuildId();
+
+    if (g_Shutdown.load()) {
+        g_HooksInstalled.store(true);
+        return 0;
+    }
 
     if (!LoadDiversion()) {
         LOG_ERROR("LoadDiversion failed");
+        g_HooksInstalled.store(true); // unblock detach even on failure
         return 1;
+    }
+
+    if (g_Shutdown.load()) {
+        g_HooksInstalled.store(true);
+        return 0;
     }
 
     Config::Load(ConfigPath);
@@ -74,10 +107,22 @@ static DWORD WINAPI InitThread(LPVOID param) {
     for (const auto& dir : watchDirs)
         LuaConfig::ParseDirectory(dir);
 
+    if (g_Shutdown.load()) {
+        g_HooksInstalled.store(true);
+        return 0;
+    }
+
     FileWatcher::Start(watchDirs);
 
+    if (g_Shutdown.load()) {
+        FileWatcher::Stop();
+        g_HooksInstalled.store(true);
+        return 0;
+    }
+
     SteamUI::CoreHook();
-    SteamClient::CoreHook();
+    if (!g_Shutdown.load())
+        SteamClient::CoreHook();
     g_HooksInstalled.store(true);
     LOG_INFO("OpenSteamTool init complete");
     return 0;
@@ -90,14 +135,37 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
         DisableThreadLibraryCalls(hModule);
         // Hand off all real work to a worker thread to avoid running file I/O,
         // LoadLibrary, and detour transactions under the loader lock.
-        HANDLE h = CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
-        if (h) CloseHandle(h);
+        g_InitThread = CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
     }
     else if (dwReason == DLL_PROCESS_DETACH)
     {
+        // Shutdown must be visible before any other detach work.  This prevents
+        // Steam from sitting on stacked timeout waits while the cursor spins.
+        g_Shutdown.store(true);
+
+        // Abort any synchronous WinHTTP request that may be blocked in another
+        // thread before waiting on that thread.
+        WinHttp::AbortAll();
         FileWatcher::Stop();
-        SteamUI::CoreUnhook();
-        SteamClient::CoreUnhook();
+
+        // BUG-01 follow-up: keep the race protection, but poll in small chunks
+        // and stop immediately once global shutdown is active.
+        if (g_InitThread) {
+            if (!g_Shutdown.load()) {
+                for (int i = 0; i < 50; ++i) {
+                    DWORD wait = WaitForSingleObject(g_InitThread, 100);
+                    if (wait != WAIT_TIMEOUT || g_Shutdown.load()) break;
+                }
+            } else {
+                WaitForSingleObject(g_InitThread, 0);
+            }
+            CloseHandle(g_InitThread);
+            g_InitThread = nullptr;
+        }
+        if (g_HooksInstalled.load()) {
+            SteamUI::CoreUnhook();
+            SteamClient::CoreUnhook();
+        }
     }
 
     return TRUE;

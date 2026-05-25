@@ -26,7 +26,7 @@ struct CaptureEntry {
 // Requires g_captures (std::vector<CaptureEntry>) in scope.
 #define ARM_CAPTURE_D(name, outVar)                                            \
     do {                                                                        \
-        if (auto* _p_ = FIND_SIG(diversion_hMdoule, name)) {                   \
+        if (auto* _p_ = FIND_SIG(diversion_hModule, name)) {                   \
             o##name = reinterpret_cast<name##_t>(_p_);                         \
             g_captures.push_back({                                              \
                 reinterpret_cast<void**>(&o##name),                            \

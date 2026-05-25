@@ -23,8 +23,10 @@
 #include "Utils/Config.h"
 
 
-inline HMODULE diversion_hMdoule = nullptr;
+inline HMODULE diversion_hModule = nullptr;
 inline std::atomic<bool> g_HooksInstalled{false};
+// Set first during DLL shutdown so every worker/wait loop can bail out immediately.
+inline std::atomic<bool> g_Shutdown{false};
 inline char SteamInstallPath[MAX_PATH] = {};
 inline char SteamclientPath[MAX_PATH] = {};
 inline char DiversionPath[MAX_PATH] = {};

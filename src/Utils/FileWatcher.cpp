@@ -8,11 +8,15 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <mutex>
 
 namespace FileWatcher {
     static std::atomic<bool> g_running{false};
     static std::thread g_watcherThread;
     static std::vector<std::string> g_watchDirs;
+    static std::mutex g_handleMutex;
+    static std::vector<HANDLE> g_activeDirHandles;
+    static std::vector<HANDLE> g_activeEvents;
 
     static const DWORD kDebounceMs = 500;
 
@@ -112,6 +116,12 @@ namespace FileWatcher {
         std::vector<HANDLE> events(numDirs, nullptr);
         std::vector<std::vector<char>> buffers(numDirs);
 
+        {
+            std::lock_guard<std::mutex> lock(g_handleMutex);
+            g_activeDirHandles.clear();
+            g_activeEvents.clear();
+        }
+
         for (size_t i = 0; i < numDirs; ++i) {
             events[i] = CreateEventA(nullptr, FALSE, FALSE, nullptr);
             overlapped[i].hEvent = events[i];
@@ -138,6 +148,12 @@ namespace FileWatcher {
                 continue;
             }
 
+            {
+                std::lock_guard<std::mutex> lock(g_handleMutex);
+                g_activeDirHandles.push_back(dirHandles[i]);
+                g_activeEvents.push_back(events[i]);
+            }
+
             LOG_PACKAGE_INFO("Watching: {}", g_watchDirs[i]);
         }
 
@@ -149,11 +165,11 @@ namespace FileWatcher {
             return;
         }
 
-        while (g_running) {
+        while (g_running && !g_Shutdown.load()) {
             DWORD waitResult = WaitForMultipleObjects(
                 static_cast<DWORD>(numDirs), events.data(), FALSE, 1000);
 
-            if (!g_running) break;
+            if (!g_running || g_Shutdown.load()) break;
             if (waitResult == WAIT_TIMEOUT) continue;
             if (waitResult < WAIT_OBJECT_0 || waitResult >= WAIT_OBJECT_0 + numDirs) continue;
 
@@ -180,21 +196,26 @@ namespace FileWatcher {
             drainEvent(waitResult - WAIT_OBJECT_0);
 
             // Debounce loop: keep waiting for more events
-            while (g_running) {
+            while (g_running && !g_Shutdown.load()) {
                 DWORD debounceResult = WaitForMultipleObjects(
                     static_cast<DWORD>(numDirs), events.data(), FALSE, kDebounceMs);
-                if (!g_running) break;
+                if (!g_running || g_Shutdown.load()) break;
                 if (debounceResult == WAIT_TIMEOUT) break; // quiet period — done accumulating
                 if (debounceResult < WAIT_OBJECT_0 || debounceResult >= WAIT_OBJECT_0 + numDirs) break;
                 drainEvent(debounceResult - WAIT_OBJECT_0);
             }
 
-            if (!order.empty())
+            if (!order.empty() && !g_Shutdown.load())
                 ProcessChanges(accumulated, order);
         }
 
-        for (auto& h : dirHandles) if (h) CloseHandle(h);
+        for (auto& h : dirHandles) if (h) { CancelIoEx(h, nullptr); CloseHandle(h); }
         for (auto& e : events) if (e) CloseHandle(e);
+        {
+            std::lock_guard<std::mutex> lock(g_handleMutex);
+            g_activeDirHandles.clear();
+            g_activeEvents.clear();
+        }
         LOG_PACKAGE_INFO("Stopped");
     }
 
@@ -208,8 +229,19 @@ namespace FileWatcher {
     }
 
     void Stop() {
-        if (!g_running) return;
-        g_running = false;
+        if (!g_running.exchange(false)) return;
+
+        // Break any pending ReadDirectoryChangesW/WaitForMultipleObjects right away.
+        {
+            std::lock_guard<std::mutex> lock(g_handleMutex);
+            for (HANDLE h : g_activeDirHandles) {
+                if (h) CancelIoEx(h, nullptr);
+            }
+            for (HANDLE e : g_activeEvents) {
+                if (e) SetEvent(e);
+            }
+        }
+
         if (g_watcherThread.joinable()) {
             g_watcherThread.join();
         }

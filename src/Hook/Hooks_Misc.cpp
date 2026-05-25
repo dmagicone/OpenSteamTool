@@ -1,6 +1,5 @@
 #include "Hooks_Misc.h"
 #include "HookMacros.h"
-#include "Hooks_SteamUI.h"
 #include "Utils/VehCommon.h"
 #include "dllmain.h"
 
@@ -35,13 +34,27 @@ namespace {
     uint8_t*  g_spawnProcessTarget;
     PVOID     g_vehHandle;
 
-    // Assumes one game at a time.  Set by SpawnProcess VEH when -onlinefix
-    // is detected; cleared when a non-onlinefix game launches.
-    AppId_t   g_OnlineFixRealAppId;
+    // BUG-05 FIX: Use std::atomic to prevent data races between the VEH
+    // writer (any thread) and ResolveAppId() reader (any thread).
+    std::atomic<AppId_t> g_OnlineFixRealAppId{0};
 
     std::unordered_map<AppId_t, std::string> g_GameNameCache;
 
     static std::vector<CaptureEntry> g_captures;
+
+    // BUG-10 FIX: Whole-word flag match to avoid strstr() matching substrings
+    // like "-onlinefix2" or "--onlinefix_v2" as "-onlinefix".
+    static bool HasExactFlag(const char* cmdLine, const char* flag) {
+        const char* pos = cmdLine;
+        const size_t len = strlen(flag);
+        while ((pos = strstr(pos, flag)) != nullptr) {
+            bool startOk = (pos == cmdLine || pos[-1] == ' ');
+            bool endOk   = (pos[len] == '\0' || pos[len] == ' ');
+            if (startOk && endOk) return true;
+            pos += len;
+        }
+        return false;
+    }
 
     // ── VEH handler ──────────────────────────────────────────────────────────
     // Scoped to this module's int3 sites only. Foreign RIP ->
@@ -76,13 +89,13 @@ namespace {
                 const char* cmdLine = reinterpret_cast<const char*>(ctx->R8);
 
                 if (LuaConfig::HasDepot(appId) && cmdLine
-                    && strstr(cmdLine, "-onlinefix")) {
-                    g_OnlineFixRealAppId = appId;
+                    && HasExactFlag(cmdLine, "-onlinefix")) {
+                    g_OnlineFixRealAppId.store(appId, std::memory_order_release);
                     *pGameID = kOnlineFixAppId;
                     LOG_MISC_INFO("SpawnProcess: appid {} -> {}, cmd=\"{}\"",
                                   appId, kOnlineFixAppId, cmdLine);
                 } else {
-                    g_OnlineFixRealAppId = 0;
+                    g_OnlineFixRealAppId.store(0, std::memory_order_release);
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -98,45 +111,6 @@ namespace {
 
         return EXCEPTION_CONTINUE_SEARCH;
     }
-
-    // ── SteamController_OptedInMask ──────────────────────────────────────────
-    // Called by CUser_BuildSpawnEnvBlock with pGameID's appid to
-    // compute EnableConfiguratorSupport and the SDL_* env vars.
-    // With 480 the spawned game inherits Spacewar's Steam Input
-    // opt-in and gameoverlayrenderer hijacks the XInput stream.
-    HOOK_FUNC(OptedInMask, __int64,
-              void* pThis, unsigned int appId)
-    {
-        if (appId == kOnlineFixAppId && g_OnlineFixRealAppId) {
-            LOG_MISC_INFO("OptedInMask: appid {} -> {}",
-                          appId, g_OnlineFixRealAppId);
-            return oOptedInMask(pThis, g_OnlineFixRealAppId);
-        }
-        return oOptedInMask(pThis, appId);
-    }
-
-    // ── CUser_BuildSpawnEnvBlock ─────────────────────────────────────────────
-    // pOverlayCGameID drives SteamOverlayGameId, which the in-game
-    // overlay reads for screenshot tags, community URLs, and asset
-    // selection.  pCGameID drives SteamGameId / SteamAppId; leave it
-    // at 480 so the in-game ownership bypass holds.
-    HOOK_FUNC(BuildSpawnEnvBlock, __int64,
-              void* pThis, uint64_t* pCGameID, void* a3, void* env,
-              uint64_t* pOverlayCGameID, void* a6, int a7,
-              void* a8, void* a9, unsigned int a10, char a11)
-    {
-        if (g_OnlineFixRealAppId && pOverlayCGameID
-            && (*pOverlayCGameID & 0xFFFFFF) == kOnlineFixAppId) {
-            uint64_t prev = *pOverlayCGameID;
-            *pOverlayCGameID = (prev & ~static_cast<uint64_t>(0xFFFFFF))
-                             | g_OnlineFixRealAppId;
-            LOG_MISC_INFO("BuildSpawnEnvBlock: overlay CGameID {:#x} -> {:#x}",
-                          prev, *pOverlayCGameID);
-        }
-        return oBuildSpawnEnvBlock(pThis, pCGameID, a3, env,
-                                    pOverlayCGameID, a6, a7,
-                                    a8, a9, a10, a11);
-    }
 }
 
 namespace Hooks_Misc {
@@ -146,26 +120,16 @@ namespace Hooks_Misc {
         LOCATE_LIST(VEH_LOCATE)
         CAPTURE_LIST(VEH_ARM)
 
-        if (auto* p = FIND_SIG(diversion_hMdoule, SpawnProcess)) {
+        if (auto* p = FIND_SIG(diversion_hModule, SpawnProcess)) {
             g_spawnProcessTarget = static_cast<uint8_t*>(p);
             VehCommon::ArmInt3(p);
         }
 
         if (!g_captures.empty() || g_spawnProcessTarget)
             g_vehHandle = AddVectoredExceptionHandler(1, VehHandler);
-
-        HOOK_BEGIN();
-        INSTALL_HOOK_D(BuildSpawnEnvBlock);
-        INSTALL_HOOK_D(OptedInMask);
-        HOOK_END();
     }
 
     void Uninstall() {
-        UNHOOK_BEGIN();
-        UNINSTALL_HOOK(BuildSpawnEnvBlock);
-        UNINSTALL_HOOK(OptedInMask);
-        UNHOOK_END();
-
         if (g_vehHandle) {
             RemoveVectoredExceptionHandler(g_vehHandle);
             g_vehHandle = nullptr;
@@ -178,7 +142,7 @@ namespace Hooks_Misc {
         g_spawnProcessTarget = nullptr;
 
         LOCATE_LIST(VEH_ZERO_RESOLVE)
-        g_OnlineFixRealAppId = 0;
+        g_OnlineFixRealAppId.store(0, std::memory_order_relaxed);
         g_GameNameCache.clear();
     }
 
@@ -197,7 +161,9 @@ namespace Hooks_Misc {
     }
 
     AppId_t ResolveAppId() {
-        if (g_OnlineFixRealAppId) return g_OnlineFixRealAppId;
+        // BUG-05 FIX: Use acquire load to safely read the atomically-stored value.
+        AppId_t id = g_OnlineFixRealAppId.load(std::memory_order_acquire);
+        if (id) return id;
         return GetAppIDForCurrentPipe();
     }
 
@@ -274,6 +240,8 @@ namespace Hooks_Misc {
                 pPkg->AppIdVec.m_Memory.m_pMemory[oldSize + i] = additions[i];
                 LOG_PACKAGE_DEBUG("NotifyLicenseChanged: inserted AppId {} at [{}]", additions[i], oldSize + i);
             }
+            // BUG-07 FIX: Update m_Size so Steam can iterate the new entries.
+            pPkg->AppIdVec.m_Size = oldSize + static_cast<uint32_t>(additions.size());
         }
 
         if (additions.empty() && removedCount == 0) {
@@ -285,12 +253,5 @@ namespace Hooks_Misc {
         oMarkLicenseAsChanged(g_pCUser, 0, true);
         oProcessPendingLicenseUpdates(g_pCUser);
         LOG_PACKAGE_INFO("NotifyLicenseChanged: {} added, {} removed", additions.size(), removedCount);
-
-        // CSteamUIAppController caches its own AppOverview entries and doesn't
-        // re-query subscription state on package mutation; remove them
-        // explicitly so the library UI reflects the dropped license.
-        for (AppId_t id : removals) {
-            Hooks_SteamUI::RemoveAppOverview(id);
-        }
     }
 }

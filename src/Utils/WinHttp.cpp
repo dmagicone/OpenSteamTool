@@ -1,10 +1,55 @@
 #include "WinHttp.h"
 #include "dllmain.h"
 #include <chrono>
+#include <mutex>
+#include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "winhttp.lib")
 
 namespace WinHttp {
+
+    namespace {
+        std::mutex g_activeMutex;
+        std::vector<HINTERNET> g_activeHandles;
+
+        void TrackHandle(HINTERNET h) {
+            if (!h) return;
+            std::lock_guard<std::mutex> lock(g_activeMutex);
+            g_activeHandles.push_back(h);
+        }
+
+        bool UntrackHandle(HINTERNET h) {
+            if (!h) return false;
+            std::lock_guard<std::mutex> lock(g_activeMutex);
+            auto it = std::find(g_activeHandles.begin(), g_activeHandles.end(), h);
+            if (it == g_activeHandles.end()) return false;
+            g_activeHandles.erase(it);
+            return true;
+        }
+
+        void CloseTrackedHandle(HINTERNET& h) {
+            if (!h) return;
+            // If AbortAll already closed this handle during shutdown, do not
+            // close the same raw handle value a second time.
+            if (UntrackHandle(h)) {
+                WinHttpCloseHandle(h);
+            }
+            h = nullptr;
+        }
+    }
+
+    void AbortAll() {
+        std::vector<HINTERNET> handles;
+        {
+            std::lock_guard<std::mutex> lock(g_activeMutex);
+            handles = g_activeHandles;
+            g_activeHandles.clear();
+        }
+        for (HINTERNET h : handles) {
+            if (h) WinHttpCloseHandle(h);
+        }
+    }
 
     ParsedUrl ParseUrl(const char* rawUrl) {
         ParsedUrl out;
@@ -47,6 +92,8 @@ namespace WinHttp {
                    DWORD timeoutSend,    DWORD timeoutRecv) {
         Result r;
 
+        if (g_Shutdown.load()) return r;
+
         ParsedUrl pu = ParseUrl(url);
         if (!pu.valid) {
             LOG_WINHTTP_WARN("Invalid URL: {}", url);
@@ -78,6 +125,7 @@ namespace WinHttp {
         DWORD flags = pu.tls ? WINHTTP_FLAG_SECURE : 0;
         HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, pu.path.c_str(),
             nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        TrackHandle(hRequest);
         if (!hRequest) {
             LOG_WINHTTP_WARN("{} - WinHttpOpenRequest failed", url);
             WinHttpCloseHandle(hConnect);
@@ -107,7 +155,7 @@ namespace WinHttp {
                 WINHTTP_NO_HEADER_INDEX);
 
             DWORD avail = 0;
-            while (WinHttpQueryDataAvailable(hRequest, &avail) && avail) {
+            while (!g_Shutdown.load() && WinHttpQueryDataAvailable(hRequest, &avail) && avail) {
                 size_t off = r.body.size();
                 r.body.resize(off + avail);
                 DWORD read = 0;
@@ -123,7 +171,7 @@ namespace WinHttp {
             r.ok = true;
         }
 
-        WinHttpCloseHandle(hRequest);
+        CloseTrackedHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
 
@@ -141,13 +189,14 @@ namespace WinHttp {
                      const wchar_t* headers,
                      const char* urlForLog) {
         Result r;
-        if (!hSession || !hConnect) return r;
+        if (g_Shutdown.load() || !hSession || !hConnect) return r;
 
         auto t0 = std::chrono::steady_clock::now();
 
         DWORD flags = tls ? WINHTTP_FLAG_SECURE : 0;
         HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, path,
             nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        TrackHandle(hRequest);
         if (!hRequest) {
             LOG_WINHTTP_WARN("{} - WinHttpOpenRequest failed", urlForLog);
             return r;
@@ -173,7 +222,7 @@ namespace WinHttp {
                 WINHTTP_NO_HEADER_INDEX);
 
             DWORD avail = 0;
-            while (WinHttpQueryDataAvailable(hRequest, &avail) && avail) {
+            while (!g_Shutdown.load() && WinHttpQueryDataAvailable(hRequest, &avail) && avail) {
                 size_t off = r.body.size();
                 r.body.resize(off + avail);
                 DWORD read = 0;
@@ -189,7 +238,7 @@ namespace WinHttp {
             r.ok = true;
         }
 
-        WinHttpCloseHandle(hRequest);
+        CloseTrackedHandle(hRequest);
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();

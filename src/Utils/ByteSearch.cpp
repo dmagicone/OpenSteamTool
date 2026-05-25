@@ -1,49 +1,9 @@
 #include "ByteSearch.h"
 #include "Log.h"
-#include <atomic>
 #include <cstdint>
 #include <psapi.h>
 #include <string>
-#include <thread>
 #include <vector>
-
-// Populated by dllmain.cpp / InitThread from steam.exe!GetBootstrapperVersion.
-// Empty before init or when the export is unavailable. Under the strict
-// matching policy below, an empty or unmatched build id is treated as an
-// unsupported Steam version.
-extern std::string g_steamBuildId;
-
-// Show an "unsupported Steam version" popup at most once per process.
-// Triggered when ByteSearch cannot find a signature whose label matches
-// the currently running Steam build id (or g_steamBuildId is empty).
-// We deliberately do NOT fall back to "try every signature in order",
-// because mis-locating an exported function leads to undefined behaviour
-// and hard-to-debug crashes inside Steam.
-static void ShowUnsupportedBuildPopupOnce()
-{
-    static std::atomic<bool> shown{false};
-    bool expected = false;
-    if (!shown.compare_exchange_strong(expected, true)) return;
-
-    // Snapshot the build id at the moment of failure so the user can
-    // include it in their bug report.
-    std::string buildId = g_steamBuildId.empty() ? "unknown" : g_steamBuildId;
-
-    // Detach so we never block the Steam process / hook init path.
-    std::thread([buildId]() {
-        std::string msg =
-            "OpenSteamTool: unsupported Steam version.\n\n"
-            "Detected Steam build id: " + buildId + "\n\n"
-            "No matching signature was found for this Steam build, so "
-            "OpenSteamTool cannot safely hook the required functions and "
-            "will be disabled for this session.\n\n"
-            "Please report this build id at:\n"
-            "https://github.com/OpenSteam001/OpenSteamTool/issues";
-        MessageBoxA(nullptr, msg.c_str(),
-                    "OpenSteamTool - Unsupported Steam Version",
-                    MB_OK | MB_ICONWARNING | MB_TOPMOST);
-    }).detach();
-}
 
 // ---- parse "48 8B ?? C4" → bytes + mask ----
 static bool ParseSignature(const char* str, std::vector<uint8_t>& bytes, std::vector<uint8_t>& mask)
@@ -112,75 +72,67 @@ static void* ScanOne(HMODULE module, const std::vector<uint8_t>& bytes,
     return nullptr;
 }
 
-// ---- try a single Signature against the module ----
-static void* TrySig(HMODULE module, const char* funcName, const Signature& sig)
+// ---- multi-signature search ----
+void* ByteSearch(HMODULE module, const char* funcName, std::initializer_list<Signature> sigs)
 {
     std::vector<uint8_t> bytes, mask;
-    if (!ParseSignature(sig.signature, bytes, mask)) {
-        LOG_WARN("ByteSearch: {} — bad signature '{}'", funcName ? funcName : "", sig.label);
-        return nullptr;
-    }
-    return ScanOne(module, bytes, mask, sig.matchIndex);
-}
 
-// ---- core multi-sig dispatcher ----
-// Strict policy: Patterns.h labels are Steam build ids (e.g. "1778803745").
-// A signature is only considered if its label exactly matches the currently
-// running Steam build id. If g_steamBuildId is empty (pre-init or older
-// Steam without the export), or no label matches, or the matching signature
-// fails to locate the function in memory, we treat the Steam version as
-// UNSUPPORTED, show a one-time popup, and return nullptr.
-//
-// Rationale: falling back to "try any signature that happens to match"
-// risks locating the wrong function and corrupting Steam at hook time.
-// A clean failure is safer than a silent mis-hook.
-static void* ByteSearchImpl(HMODULE module, const char* funcName,
-                            const Signature* sigs, size_t count)
-{
-    if (!g_steamBuildId.empty()) {
-        for (size_t i = 0; i < count; ++i) {
-            if (!sigs[i].label || g_steamBuildId != sigs[i].label) continue;
-
-            if (void* addr = TrySig(module, funcName, sigs[i])) {
-                if (funcName) {
-                    // HMODULE on Windows is the loaded image base, so
-                    // (addr - module) gives the RVA directly.
-                    uintptr_t rva = reinterpret_cast<uintptr_t>(addr) -
-                                    reinterpret_cast<uintptr_t>(module);
-                    LOG_DEBUG("ByteSearch: {} matched build-id '{}' @ RVA 0x{:X}",
-                              funcName, sigs[i].label, rva);
-                }
-                return addr;
-            }
-
-            // Label matched, but the byte pattern didn't hit memory —
-            // treat as unsupported (the signature for this build is stale).
-            LOG_WARN("ByteSearch: {} — signature for build '{}' did not match in memory",
-                     funcName ? funcName : "", sigs[i].label);
-            break;  // at most one entry per build id
+    for (const auto& sig : sigs) {
+        if (!ParseSignature(sig.signature, bytes, mask)) {
+            LOG_WARN("ByteSearch: {} — bad signature '{}'", funcName ? funcName : "", sig.label);
+            continue;
+        }
+        void* addr = ScanOne(module, bytes, mask, sig.matchIndex);
+        if (addr) {
+            if (funcName)
+                LOG_DEBUG("ByteSearch: {} matched '{}'", funcName, sig.label);
+            return addr;
         }
     }
 
-    // No matching label (or matching signature didn't hit). Unsupported build.
-    if (funcName) {
-        LOG_WARN("ByteSearch FAILED: {} (build={}) — no signature available for this Steam version",
-                 funcName,
-                 g_steamBuildId.empty() ? "unknown" : g_steamBuildId.c_str());
-    }
-    ShowUnsupportedBuildPopupOnce();
-    return nullptr;
-}
+    // all failed
+    if (!funcName) return nullptr;          // single-sig caller handles its own log
 
-// ---- multi-signature search (initializer_list) ----
-void* ByteSearch(HMODULE module, const char* funcName, std::initializer_list<Signature> sigs)
-{
-    return ByteSearchImpl(module, funcName, sigs.begin(), sigs.size());
+    std::string failedList;
+    for (const auto& sig : sigs) {
+        if (!failedList.empty()) failedList += ", ";
+        failedList += "'";
+        failedList += sig.label;
+        failedList += "'";
+    }
+    LOG_WARN("ByteSearch FAILED: {} — tried: {}", funcName, failedList);
+    return nullptr;
 }
 
 // ---- pointer + count overload ----
 void* ByteSearch(HMODULE module, const char* funcName, const Signature* sigs, size_t count)
 {
-    return ByteSearchImpl(module, funcName, sigs, count);
+    std::vector<uint8_t> bytes, mask;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (!ParseSignature(sigs[i].signature, bytes, mask)) {
+            LOG_WARN("ByteSearch: {} — bad signature '{}'", funcName ? funcName : "", sigs[i].label);
+            continue;
+        }
+        void* addr = ScanOne(module, bytes, mask, sigs[i].matchIndex);
+        if (addr) {
+            if (funcName)
+                LOG_DEBUG("ByteSearch: {} matched '{}'", funcName, sigs[i].label);
+            return addr;
+        }
+    }
+
+    if (!funcName) return nullptr;
+
+    std::string failedList;
+    for (size_t i = 0; i < count; ++i) {
+        if (!failedList.empty()) failedList += ", ";
+        failedList += "'";
+        failedList += sigs[i].label;
+        failedList += "'";
+    }
+    LOG_WARN("ByteSearch FAILED: {} — tried: {}", funcName, failedList);
+    return nullptr;
 }
 
 // ---- memory patching ----

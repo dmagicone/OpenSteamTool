@@ -77,11 +77,17 @@ namespace {
         return true;
     }
 
+    // BUG-06 FIX: Protect the ring-buffer pool with a mutex to prevent
+    // data races when two Steam threads call ReplaceRecvPacket concurrently.
+    static std::mutex g_RecvPoolMutex;
+    static std::mutex g_SendPoolMutex;
+
     // ── Incoming: replace header and/or body (ring-buffer pool) ──
     inline void ReplaceRecvPacket(CNetPacket* p,
                                   const uint8* pNewHdr, uint32 cbNewHdr,
                                   const uint8* pNewBody, uint32 cbNewBody)
     {
+        std::lock_guard<std::mutex> lock(g_RecvPoolMutex);
         uint32 newSize = sizeof(MsgHdr) + cbNewHdr + cbNewBody;
         if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
@@ -105,6 +111,7 @@ namespace {
                                     const uint8* pNewBody, uint32 cbNewBody,
                                     uint32* pNewSize)
     {
+        std::lock_guard<std::mutex> lock(g_SendPoolMutex);
         *pNewSize = sizeof(MsgHdr) + cbHdr + cbNewBody;
         if (*pNewSize > sizeof(g_SendPacketPool[0])) return nullptr;
 
@@ -205,7 +212,10 @@ namespace Hooks_NetPacket_AccessToken {
 namespace Hooks_NetPacket_UserStats {
 
     // jobid_source -> appid mapping (eMsg 151 request -> eMsg 147 response)
-    std::unordered_map<uint64, AppId_t> g_JobIdToAppId;
+    // BUG-03 FIX: Store a timestamp alongside each entry so stale entries
+    // (from dropped/timed-out packets) can be pruned to prevent unbounded growth.
+    struct JobEntry { AppId_t appId; std::chrono::steady_clock::time_point ts; };
+    std::unordered_map<uint64, JobEntry> g_JobIdToAppId;
 
     // ── Send: CPlayer_GetUserStats_Request (eMsg 151) ──────────
     bool HandleSend_GetUserStats(const uint8* pBody, uint32 cbBody,
@@ -240,7 +250,13 @@ namespace Hooks_NetPacket_UserStats {
         CMsgProtoBufHeader hdr;
         if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
             uint64 jobId = hdr.jobid_source();
-            g_JobIdToAppId[jobId] = appId;
+            // BUG-03 FIX: Prune entries older than 30 seconds before inserting,
+            // so dropped/timed-out packets don't cause unbounded map growth.
+            auto now = std::chrono::steady_clock::now();
+            std::erase_if(g_JobIdToAppId, [&](const auto& kv) {
+                return (now - kv.second.ts) > std::chrono::seconds(30);
+            });
+            g_JobIdToAppId[jobId] = { appId, now };
             LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: stored jobid={} -> appid={}", jobId, appId);
         }
 
@@ -248,6 +264,11 @@ namespace Hooks_NetPacket_UserStats {
         req.set_steamid(newSteamId);
 
         g_cbSendNewBody = static_cast<uint32>(req.ByteSizeLong());
+        // BUG-08 FIX: Guard against buffer overrun before serializing.
+        if (g_cbSendNewBody > kMaxBodySize) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: encoded size {} exceeds buffer", g_cbSendNewBody);
+            return false;
+        }
         if (!req.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: failed to encode");
             return false;
@@ -277,7 +298,7 @@ namespace Hooks_NetPacket_UserStats {
             uint64 jobId = hdrMsg.jobid_target();
             auto it = g_JobIdToAppId.find(jobId);
             if (it != g_JobIdToAppId.end()) {
-                appId = it->second;
+                appId = it->second.appId;
                 hasAppId = true;
                 LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: matched jobid={} -> appid={}", jobId, appId);
                 g_JobIdToAppId.erase(it);
@@ -305,12 +326,18 @@ namespace Hooks_NetPacket_UserStats {
         }
 
         resp.clear_stats();
-        g_NewBodySize = static_cast<uint32>(resp.ByteSizeLong());
-        if (!resp.SerializeToArray(const_cast<uint8*>(pBody), cbBody)){
+        // BUG-02 FIX: Write into g_NewBody instead of const_cast-ing Steam's
+        // read-only buffer, which is undefined behavior and a potential AV.
+        g_cbNewBody = static_cast<uint32>(resp.ByteSizeLong());
+        if (g_cbNewBody > kMaxBodySize) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: modified body too large");
+            return;
+        }
+        if (!resp.SerializeToArray(g_NewBody, kMaxBodySize)){
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to SerializeToArray modified response");
             return;
         }
-        g_ResizedInPlace = true;
+        g_NeedReplaceBody = true;
 
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: modified body:\n{}", resp.DebugString());
     }
@@ -334,10 +361,11 @@ namespace Hooks_NetPacket_UserStats {
             LOG_ACHIEVEMENT_WARN("ClientGetUserStats request: appid={} is not in addappid", appId);
             return false;
         }
-        if (!req.has_schema_local_version() || req.schema_local_version() != -1) {
-            LOG_ACHIEVEMENT_WARN("ClientGetUserStats request: schema_local_version is not -1");
-            return false;
-        }
+        // Force schema_local_version to -1 so Steam always returns the full schema
+        // regardless of what's cached locally. Without this, Steam treats any real
+        // version number as "I already have this" and returns nothing, making the
+        // SteamID spoof pointless. HasDepot() above already gates on our appids.
+        req.set_schema_local_version(-1);
 
         uint64_t newSteamId = LuaConfig::GetStatSteamId(appId);
         req.set_steam_id_for_user(newSteamId);
@@ -369,11 +397,16 @@ namespace Hooks_NetPacket_UserStats {
         resp.set_eresult(1);  // k_EResultOK
         LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: clear stats and achievement_blocks, set eresult=OK");
 
-        g_NewBodySize = static_cast<uint32>(resp.ByteSizeLong());
-        if (!resp.SerializeToArray(const_cast<uint8*>(pBody), cbBody))
+        // BUG-02 FIX: Write into g_NewBody instead of const_cast-ing Steam's
+        // read-only buffer, which is undefined behavior and a potential AV.
+        g_cbNewBody = static_cast<uint32>(resp.ByteSizeLong());
+        if (g_cbNewBody > kMaxBodySize) {
+            LOG_ACHIEVEMENT_WARN("ClientGetUserStats response: modified body too large");
+            return false;
+        }
+        if (!resp.SerializeToArray(g_NewBody, kMaxBodySize))
             return false;
 
-        g_ResizedInPlace = true;
         LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: modified body:\n{}", resp.DebugString());
         return true;
     }
@@ -505,6 +538,8 @@ namespace Hooks_NetPacket_Manifest {
     void HandleRecv(const uint8* pBody, uint32 cbBody,
                     const uint8* pHdr, uint32 cbHdr)
     {
+        if (g_Shutdown.load()) return;
+
         CMsgProtoBufHeader hdr;
         if (!hdr.ParseFromArray(pHdr, cbHdr)){
             LOG_MANIFEST_WARN("GetManifestRequestCode recv: failed to ParseFromArray original header");
@@ -519,13 +554,28 @@ namespace Hooks_NetPacket_Manifest {
             auto it = g_CodeFutures.find(jobId);
             if (it == g_CodeFutures.end()) return;
             future = it->second;
-            g_CodeFutures.erase(it); // Always clean up immediately
         }
-        // Wait up to kMaxWaitSeconds seconds for the HTTP fetch to complete
-        auto status = future.wait_for(std::chrono::seconds(kMaxWaitSeconds));
+        // Wait up to kMaxWaitSeconds seconds for the HTTP fetch to complete,
+        // but never hold Steam open during DLL shutdown.
+        std::future_status status = std::future_status::timeout;
+        for (uint32 i = 0; i < kMaxWaitSeconds * 10; ++i) {
+            if (g_Shutdown.load()) {
+                LOG_MANIFEST_DEBUG("GetManifestRequestCode recv: shutdown while waiting for jobid={}", jobId);
+                return;
+            }
+            status = future.wait_for(std::chrono::milliseconds(100));
+            if (status == std::future_status::ready) break;
+        }
         if (status != std::future_status::ready) {
             LOG_MANIFEST_WARN("GetManifestRequestCode recv: HTTP timed out for jobid={}", jobId);
             return;
+        }
+
+        if (g_Shutdown.load()) return;
+
+        {
+            std::lock_guard<std::mutex> lock(g_CodeMutex);
+            g_CodeFutures.erase(jobId);
         }
 
         uint64 code = future.get();

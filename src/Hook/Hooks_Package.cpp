@@ -18,6 +18,9 @@ namespace {
                 oCUtlMemoryGrow(&pInfo->AppIdVec, numToAdd);
                 for (uint32 i = 0; i < numToAdd; i++)
                     pInfo->AppIdVec.m_Memory.m_pMemory[oldSize + i] = appIds[i];
+                // BUG-07 FIX: m_Size must be updated so Steam can iterate
+                // the newly added AppIds; without this they are invisible.
+                pInfo->AppIdVec.m_Size = oldSize + numToAdd;
             }
         }
 

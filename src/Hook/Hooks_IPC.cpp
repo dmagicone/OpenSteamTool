@@ -20,13 +20,26 @@ namespace {
     // ════════════════════════════════════════════════════════════════
     using namespace Hooks_IPC;
 
-    std::vector<IpcHandlerEntry> g_Handlers;
+    // BUG-09 FIX: Use an unordered_map for O(1) handler lookup instead of
+    // O(N) linear scan on the hot IPC path called continuously by Steam.
+    struct IpcKey {
+        EIPCInterface iface;
+        uint32 funcHash;
+        bool operator==(const IpcKey& o) const {
+            return iface == o.iface && funcHash == o.funcHash;
+        }
+    };
+    struct IpcKeyHash {
+        size_t operator()(const IpcKey& k) const {
+            return std::hash<uint64_t>{}((static_cast<uint64_t>(k.iface) << 32) | k.funcHash);
+        }
+    };
+
+    std::unordered_map<IpcKey, IpcHandlerEntry, IpcKeyHash> g_Handlers;
 
     static const IpcHandlerEntry* FindHandler(EIPCInterface iface, uint32 funcHash) {
-        for (auto& e : g_Handlers) {
-            if (e.interfaceID == iface && e.funcHash == funcHash) return &e;
-        }
-        return nullptr;
+        auto it = g_Handlers.find({iface, funcHash});
+        return it != g_Handlers.end() ? &it->second : nullptr;
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -97,7 +110,8 @@ namespace {
 namespace Hooks_IPC {
 
     void RegisterHandlers(const IpcHandlerEntry* entries, size_t count) {
-        g_Handlers.insert(g_Handlers.end(), entries, entries + count);
+        for (size_t i = 0; i < count; ++i)
+            g_Handlers[{entries[i].interfaceID, entries[i].funcHash}] = entries[i];
     }
 
     void Install() {

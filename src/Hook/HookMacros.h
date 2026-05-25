@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────
 // Hook boilerplate elimination macros.
 //
-// Convention: macros ending in _D use diversion_hMdoule as module.
+// Convention: macros ending in _D use diversion_hModule as module.
 // Standard macros (no _D suffix) take an explicit module argument.
 // ─────────────────────────────────────────────────────────────────
 
@@ -57,7 +57,7 @@
         }                                                             \
     } while (0)
 
-#define INSTALL_HOOK_D(name)            INSTALL_HOOK(diversion_hMdoule, name)
+#define INSTALL_HOOK_D(name)            INSTALL_HOOK(diversion_hModule, name)
 
 #define INSTALL_HOOK_EX(module, name, sigs)                           \
     do {                                                              \
@@ -69,19 +69,19 @@
         }                                                             \
     } while (0)
 
-#define INSTALL_HOOK_EX_D(name, sigs)     INSTALL_HOOK_EX(diversion_hMdoule, name, sigs)
+#define INSTALL_HOOK_EX_D(name, sigs)     INSTALL_HOOK_EX(diversion_hModule, name, sigs)
 
 // ── resolve ─────────────────────────────────────────────────────
 // Find signature → cast to name##_t → assign to o##name.  No Detours.
 #define RESOLVE(module, name) \
     o##name = reinterpret_cast<name##_t>(FIND_SIG(module, name))
 
-#define RESOLVE_D(name)       RESOLVE(diversion_hMdoule, name)
+#define RESOLVE_D(name)       RESOLVE(diversion_hModule, name)
 
 #define RESOLVE_EX(module, name, sigs) \
     o##name = reinterpret_cast<name##_t>(ByteSearch(module, #name, sigs, std::size(sigs)))
 
-#define RESOLVE_EX_D(name, sigs)  RESOLVE_EX(diversion_hMdoule, name, sigs)
+#define RESOLVE_EX_D(name, sigs)  RESOLVE_EX(diversion_hModule, name, sigs)
 
 // ── uninstall ───────────────────────────────────────────────────
 // Call between UNHOOK_BEGIN / UNHOOK_END.
